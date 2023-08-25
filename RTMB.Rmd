@@ -1,0 +1,327 @@
+---
+title: "Playing around with RTMB"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Motivation
+
+TMB book https://kaskr.github.io/adcomp/_book/Introduction.html
+
+## Linear regression
+
+Example from <https://github.com/kaskr/RTMB/blob/master/tmb_examples/linreg.R>
+
+```{r}
+library(RTMB)
+set.seed(123)
+data <- list(Y = rnorm(10) + 1:10, x=1:10)
+parameters <- list(a=0, b=0, logSigma=0)
+
+f <- function(parms) {
+    Y <- data$Y
+    x <- data$x
+    a <- parms$a
+    b <- parms$b
+    logSigma <- parms$logSigma
+    ADREPORT(exp(2*logSigma));
+    nll = -sum(dnorm(Y, a+b*x, exp(logSigma), TRUE))
+    nll
+}
+obj <- MakeADFun(f, parameters)
+
+obj$hessian <- TRUE
+opt <- do.call("optim", obj)
+opt
+opt$hessian ## <-- FD hessian from optim
+obj$he()    ## <-- Analytical hessian
+rep <- sdreport(obj)
+summary(rep)
+
+```
+## Another example from <https://seananderson.ca/2014/10/17/tmb/>
+
+```{r}
+tmb_model <- "
+// linear regression
+#include <TMB.hpp>
+
+template<class Type>
+Type objective_function<Type>::operator() () {
+// data:
+DATA_VECTOR(x);
+DATA_VECTOR(y);
+
+// parameters:
+PARAMETER(a); // intercept
+PARAMETER(b); // slope
+PARAMETER(log_sigma); // log(residual SD)
+// we fit sigma on a log scale to keep it > 0
+
+// procedures: (transformed parameters)
+Type sigma = exp(log_sigma);
+
+int n = y.size(); // get number of data points to loop over
+
+Type nll = 0.0; // initialize negative log likelihood
+
+for(int i = 0; i < n; i++){ // C++ starts loops at 0!
+  // get negative log likelihood (last argument is log = TRUE)
+  nll -= dnorm(y[i], a + b * x[i], sigma, true);
+}
+
+return nll;
+}"
+write(tmb_model, file = "regression.cpp")
+```
+
+```{r}
+library(TMB)
+compile("regression.cpp")
+dyn.load(dynlib("regression"))
+```
+
+```{r}
+set.seed(123)
+x <- runif(20, 1, 10)
+y <- rnorm(20, mean = 1.8 + 2.4 * x, sd = exp(0.3))
+plot(x, y)
+```
+
+```{r}
+obj <- MakeADFun(
+  data = list(x = x, y = y), 
+  parameters = list(a = 0, b = 0, log_sigma = 0),
+  DLL = "regression")
+opt <- nlminb(start = obj$par, obj = obj$fn, gr = obj$gr)
+rep <- sdreport(obj)
+```
+
+```{r}
+rep
+```
+
+```{r}
+arm::display(lm(y ~ x))
+```
+
+
+## Yet another example from <https://seananderson.ca/2014/10/17/tmb/>
+
+Gompertz SSM
+
+$$
+\begin{aligned}
+y_t &= \ln N_t\\
+U_t &= a + b U_{t-1} + \epsilon_t\\
+\epsilon_t &\sim \mathrm{Normal}(0, \sigma^2_\mathrm{proc})\\\
+y_t &\sim \mathrm{Normal}(U_t, \sigma^2_\mathrm{obs}),
+\end{aligned}
+$$
+
+Model
+
+```{r tmb-model}
+tmb_model <- "
+// State-space Gompertz model
+#include <TMB.hpp>
+
+template<class Type>
+Type objective_function<Type>::operator() () {
+// data:
+DATA_VECTOR(y);
+
+// parameters:
+PARAMETER(a); // population growth rate parameter
+PARAMETER(b); // density dependence parameter
+PARAMETER(log_sigma_proc); // log(process SD)
+PARAMETER(log_sigma_obs); // log(observation SD)
+PARAMETER_VECTOR(u); // unobserved state vector
+
+// procedures: (transformed parameters)
+Type sigma_proc = exp(log_sigma_proc);
+Type sigma_obs = exp(log_sigma_obs);
+
+// reports on transformed parameters:
+ADREPORT(sigma_proc)
+ADREPORT(sigma_obs)
+
+int n = y.size(); // get time series length
+
+Type nll = 0.0; // initialize negative log likelihood
+
+// process model:
+for(int i = 1; i < n; i++){
+  Type m = a + b * u[i - 1]; // Gompertz
+  nll -= dnorm(u[i], m, sigma_proc, true);
+}
+
+// observation model:
+for(int i = 0; i < n; i++){
+  nll -= dnorm(y[i], u[i], sigma_obs, true);
+}
+
+return nll;
+}"
+write(tmb_model, file = "gompertztmb.cpp")
+```
+
+We'll compile the model:
+
+```{r compile, message=FALSE, results='hide'}
+compile("gompertztmb.cpp")
+dyn.load(dynlib("gompertztmb"))
+```
+
+And write a function that simulates some data, fits the model, and plots the estimates:
+
+```{r fitfunction}
+sim_gomp <- function(N = 100, seed = 123, sigma_obs = 0.2,
+  sigma_proc = 0.2, a = 1.4, b = 0.7, y1 = 4) {
+
+  set.seed(seed)
+  N <- N
+  ytrue <- numeric(length = N)
+  ytrue[1] <- y1
+  log_sigma_proc <- log(sigma_proc)
+  proc_error <- rnorm(N, mean = 0, sd = sigma_proc)
+  log_sigma_obs <- log(sigma_obs)
+  for(i in 2:N) {
+    ytrue[i] <- a + b * ytrue[i-1] + proc_error[i-1]
+    }
+  x <- seq_len(N)
+  y <- rnorm(N, mean = ytrue, sd = sigma_obs)
+
+  data <- list(y = y)
+  parameters <- list(a = 1, b = 0.5, log_sigma_proc = -1,
+    log_sigma_obs = -1, u = rep(mean(y), N))
+  obj <- MakeADFun(data, parameters, random = "u", DLL = "gompertztmb")
+  obj$hessian <- FALSE
+  opt <- nlminb(start = obj$par, obj = obj$fn, gr = obj$gr)
+  rep <- sdreport(obj)
+
+  # extract estimated process:
+  u <- summary(rep, "random")[, "Estimate"]
+  u_se <- summary(rep, "random")[, "Std. Error"]
+  # extract fixed effects:
+  fixed <- summary(rep, "fixed")
+
+  # We'll write a little helper function to plot fixed effect
+  # estimates:
+  plot_fixed <- function(par, y, mat, trans = I) {
+    points(trans(eval(parse(text = par))), y, pch = 21,
+      bg = "#00000030", col = "#00000080")
+    f <- mat[par, "Estimate"]
+    se <- mat[par, "Std. Error"]
+    points(trans(f), y, pch = 19, col = "red")
+    segments(trans(f - 2 * se), y, trans(f + 2 * se), y, pch = 19,
+      col = "red")
+    }
+
+  par(mfrow = c(2, 1), mar = c(4, 6, 0, 0), oma = c(.5, .5, .5, .5),
+    mgp = c(2, 0.5, 0), cex = 1, tck = -0.02)
+  plot(1, 1, xlim = c(0, 2), ylim = c(1, 4), type = "n",
+    xlab = "Coefficient value", ylab = "", yaxt = "n")
+  axis(2, at = 1:4, labels = c("a", "b", "sigma_obs", "sigma_proc"),
+    las = 1)
+
+  plot_fixed("a", 1, fixed)
+  plot_fixed("b", 2, fixed)
+  plot_fixed("log_sigma_obs", 3, fixed, trans = function(z) exp(z))
+  plot_fixed("log_sigma_proc", 4, fixed, trans = function(z) exp(z))
+
+  plot(x, y, col = "#00000080", pch = 21, bg = "#00000030", las = 1,
+    ylab = "log(abundance)", xlab = "time")
+  lines(x, ytrue, lty = 2, lwd = 2)
+  lines(x, u, col = "red", lty = 1, lwd = 1.5)
+  polygon(c(x, rev(x)), c(u - 2 * u_se, rev(u + 2 * u_se)),
+    border = NA, col = "#FF000050")
+  legend("bottomright", legend = c("Observed", "True", "Estimated"),
+    pch = c(21, NA, NA), lty = c(NA, 2, 1), lwd = c(NA, 2, 1.5),
+    col = c("#00000080", "black", "red"),
+    pt.bg = c("#00000030", NA, NA))
+  }
+```
+
+One good test that you've coded a model correctly is to throw a boat-load of data at it and make sure it comes back with unbiased parameter estimates. In the following plots, the first panel shows the coefficient estimates ("fixed effects") +/- two standard errors. The red dots are our estimates and the shaded grey dots are the true values. In the lower panels, the red lines are our estimated states, the black line (hidden behind the red in the first plot) is the true underlying state, and the grey dots are our observations.
+
+Now we can try a more realistic 50 data points:
+
+```{r tmb-short, results='hide', message=FALSE, warning=FALSE, fig.height=8, tidy=FALSE}
+sim_gomp(N = 50)
+```
+
+And with a different seed value but more data:
+
+```{r tmb-seed2, results='hide', message=FALSE, warning=FALSE, fig.height=8}
+sim_gomp(N = 100, seed = 999)
+```
+
+
+## Capture-recapture HMM
+
+First, let's read in the data.
+
+```{r}
+set.seed(1)
+
+# read in data
+data = read.table('titis2.txt')
+#data = rbind(data,data,data,data,data) # increase sample size artificially
+
+# define various quantities
+nh <- dim(data)[1]
+k <- dim(data)[2]
+km1 <- k-1
+
+# counts
+eff <- rep(1,nh)
+  
+# compute the date of first capture fc, and state at initial capture init.state
+fc <- NULL
+init.state <- NULL
+for (i in 1:nh){
+  temp <- 1:k
+  fc <- c(fc,min(which(data[i,]!=0)))
+  init.state <- c(init.state,data[i,fc[i]])
+}
+
+# init values
+binit <- runif(9)
+  
+# transpose data
+data <- t(data)
+```
+
+Now the TMB implementation:
+
+```{r}
+library(TMB)
+compile("multievent_tmb.cpp")
+dyn.load(dynlib("multievent_tmb"))
+```
+
+```{r message=FALSE, warning=FALSE}
+f <- MakeADFun(
+  data = list(ch = data, fc = fc, fs = init.state), 
+  parameters = list(b = binit),
+  DLL = "multievent_tmb")
+opt <- do.call("optim", f) # optimisation
+f$fn(binit) # evaluate likelihood at the inits
+f$report()$B # display B
+f$report()$BE # display BE
+f$report()$A # display A
+f$report()$PROP # display PROP
+rep <- sdreport(f)
+rep # get SEs
+```
+
+
+## Capture-recapture with random effects
+
+Check out <https://github.com/admb-project/admb-examples/blob/master/mark-recapture/mark-recapture-random-effects-model.md>
+
+And <https://github.com/oliviergimenez/occupancy_in_ADMB/blob/master/dynamic_occupancy_in_ADMB.Rmd>
+
+
