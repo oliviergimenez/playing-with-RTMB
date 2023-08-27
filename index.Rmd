@@ -1,0 +1,355 @@
+---
+title: "Time random effects in CJS models: TMB for the win"
+output: html_document
+date: "2023-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Motivation
+
+I'd like to have temporal random effect on the recapture probability of the CJS model to account for variation in sampling effort. I could go for a temporal covariate, a proxy of sampling effort. But a time effect should do the job too. A fixed time effect is too data hungry. Let's explore random effects. The reflex is to go Bayesian, with NIMBLE as far as I'm concerned, but I'd like to explore a frequentist approach as well, with TMB.
+
+## Nice resources to introduce TMB with R
+
++ A very nice intro by Rebecca Stubbs, perfect for beginners: https://rpubs.com/BeccaStubbs/tmb_simple_distributions
+
++ Another very nice intro by the Eco-Stats research group https://www.dropbox.com/s/f5ng7t6pgnvcvmp/TMB_Intro.html?dl=0
+
++ In the HMM context, there is this cool paper by Bacri and colleagues: https://onlinelibrary.wiley.com/doi/10.1002/bimj.202100256
+
++ Some official useful material:   
+    - THe TMB wiki: https://github.com/kaskr/adcomp/wiki
+    - The TMB book: https://kaskr.github.io/adcomp/_book/Introduction.html
+    - The official introduction/tutorial to TMB https://github.com/kaskr/adcomp/wiki/Tutorial
+    + The material from a TMB workshop: https://github.com/TMB-ADMB-Workshops/tmb_workshop
+
+## Simple model with constant survival/recapture probabilities
+
+We use the dipper data for illustration. 
+
+Wrangle data:
+```{r}
+# get dipper data
+library(tidyverse)
+library(mra)
+data(dipper.data)
+data <- dipper.data %>% select(-males,-females) %>% as.matrix()
+
+# define various quantities
+nh <- dim(data)[1]
+k <- dim(data)[2]
+km1 <- k-1
+
+# counts
+eff <- rep(1,nh)
+  
+# compute the date of first capture fc, and state at initial capture init.state
+fc <- NULL
+init.state <- NULL
+for (i in 1:nh){
+  temp <- 1:k
+  fc <- c(fc,min(which(data[i,]!=0)))
+  init.state <- c(init.state,data[i,fc[i]])
+}
+
+# transpose data
+data <- t(data)
+```
+
+Now the TMB implementation:
+```{r}
+# load TMB
+library(TMB)
+
+# delete existing files before compilation
+cpp_version <- "phip2"
+if (file.exists(paste0(cpp_version,".o"))) file.remove(paste0(cpp_version,".so"),
+                                                       paste0(cpp_version,".o"))
+
+# compile and load library
+compile("phip2.cpp")
+dyn.load(dynlib("phip2"))
+```
+
+Optimisation:
+```{r message=FALSE, warning=FALSE}
+f <- MakeADFun(
+  data = list(ch = data, fc = fc, fs = init.state), 
+  parameters = list(phib = 0.5, detb = 0.5),
+  DLL = "phip2",
+  silent = TRUE)
+opt <- do.call("optim", f) # optimisation
+opt$par
+rep <- sdreport(f)
+plogis(rep$par.fixed)
+```
+
+## Model with fixed effect of time on recapture prob
+
+Get/wrangle data:
+```{r}
+# get dipper data
+library(tidyverse)
+library(mra)
+data(dipper.data)
+data <- dipper.data %>% select(-males,-females) %>% as.matrix()
+
+# define various quantities
+nh <- dim(data)[1]
+k <- dim(data)[2]
+km1 <- k-1
+
+# counts
+eff <- rep(1,nh)
+  
+# compute the date of first capture fc, and state at initial capture init.state
+fc <- NULL
+init.state <- NULL
+for (i in 1:nh){
+  temp <- 1:k
+  fc <- c(fc,min(which(data[i,]!=0)))
+  init.state <- c(init.state,data[i,fc[i]])
+}
+
+# transpose data
+data <- t(data)
+```
+
+Now the TMB implementation:
+```{r}
+library(TMB)
+cpp_version <- "phipt"
+if (file.exists(paste0(cpp_version,".o"))) file.remove(paste0(cpp_version,".so"),
+                                                       paste0(cpp_version,".o"))
+compile("phipt.cpp")
+dyn.load(dynlib("phipt"))
+```
+
+Optimisation:
+```{r message=FALSE, warning=FALSE}
+parameters <- list(phib = runif(1), detb = runif(6))
+mydata <- list(ch = data, fc = fc, fs = init.state)
+obj <- MakeADFun(data = mydata, parameters = parameters, DLL = "phipt")
+obj$hessian <- TRUE
+opt <- do.call("optim", obj)
+opt
+opt$hessian ## <-- FD hessian from optim
+obj$he()    ## <-- Analytical hessian
+
+rep <- sdreport(obj)
+rep
+plogis(rep$par.fixed)
+summary(rep, "report")
+```
+
+
+With RMark:
+```{r}
+library(RMark)
+dipper <- data.frame(ch = unite(t(data) %>% as_tibble(), 
+                                col = "ch", 
+                                sep = ""))
+dipper.proc <- process.data(data = dipper)
+dipper.ddl <- make.design.data(dipper.proc)
+phi <- list(formula=~1)     # constant
+pt <- list(formula=~time)   # time
+phi.pt <- mark(dipper.proc,
+               dipper.ddl,
+               model.parameters = list(Phi = phi, p = pt),
+               delete = TRUE)
+phi.pt$results$real
+
+```
+
+We're good.
+
+
+## Model with random effect of time on recapture prob
+
+### Simulations
+
+I simulate encounter histories starting with 650 individuals over 20 years with survival set to 0.8. I release 200 individuals every 5 years, except the last cohort which is 250 individuals. Detection is 0.6 the first 15 years, then 0.9 for the 4 remaining years:
+```{r}
+# set the scene
+set.seed(3) # for reproducibility
+nyear <- 20 # duration of the study
+det <- c(rep(0.6,15), rep(0.9,4))# detection
+phi <- 0.8
+nind <- 650 # nb of individuals
+expit <- function(x){exp(x)/(1+exp(x))} # reciprocal logit function
+z <- data <- x <- matrix(NA, nrow = nind, ncol = nyear)
+first <- c(rep(1, 200), rep(5, 200), rep(10, 200), rep(15, 250))
+
+# simulate encounter histories
+for(i in 1:nind){
+  z[i,first[i]] <- x[i,first[i]] <- 1
+  for(j in (first[i]+1):nyear){
+    z[i,j]<-rbinom(1,1,phi*z[i,j-1])
+    x[i,j]<-rbinom(1,1,z[i,j]*det[j-1])
+  }
+}
+his <- x
+his[is.na(his)] <- 0 # remove lines with 0's
+```
+
+
+### RMARK
+
+```{r}
+# format data
+k <- ncol(his) # nb of capture occasions
+n <- nrow(his) # nb of individuals
+out <- array(dim=n)
+for (i in 1:n){
+	y <- (his[i,] > 0) * 1
+	out[i] <- paste(y,collapse="")
+}
+capt.hist <- data.frame(ch = out)
+
+# model fitting
+library(RMark)
+dipper.proc <- process.data(data = capt.hist)
+dipper.ddl <- make.design.data(dipper.proc)
+phi <- list(formula=~1)     # constant
+pt <- list(formula=~time)   # time
+phi.pt <- mark(dipper.proc,
+               dipper.ddl,
+               model.parameters = list(Phi = phi, p = pt),
+               delete = TRUE)
+#phi.pt$results$beta
+phi.pt$results$real
+```
+
+### NIMBLE
+
+```{r}
+# load NIMBLE
+library(nimble)
+
+# Model code
+hmm.phipt <- nimbleCode({
+  phi ~ dunif(0, 1) # prior survival
+  gamma[1,1] <- phi      # Pr(alive t -> alive t+1)
+  gamma[1,2] <- 1 - phi  # Pr(alive t -> dead t+1)
+  gamma[2,1] <- 0        # Pr(dead t -> alive t+1)
+  gamma[2,2] <- 1        # Pr(dead t -> dead t+1)
+  delta[1] <- 1          # Pr(alive t = 1) = 1
+  delta[2] <- 0          # Pr(dead t = 1) = 0
+  sig ~ dunif(0, 5)
+  mu ~ dnorm(0, 1.5)
+  for (t in 1:(T-1)){
+    logit(p[t]) <- mu + sig * eps[t] # prior detection
+    eps[t] ~ dnorm(0, sd = 1)
+    omega[1,1,t] <- 1 - p[t]    # Pr(alive t -> non-detected t)
+    omega[1,2,t] <- p[t]        # Pr(alive t -> detected t)
+    omega[2,1,t] <- 1        # Pr(dead t -> non-detected t)
+    omega[2,2,t] <- 0        # Pr(dead t -> detected t)
+  }
+  # likelihood
+  for (i in 1:N){
+    z[i,first[i]] ~ dcat(delta[1:2])
+    for (j in (first[i]+1):T){
+      z[i,j] ~ dcat(gamma[z[i,j-1], 1:2])
+      y[i,j] ~ dcat(omega[z[i,j], 1:2, j-1])
+    }
+  }
+})
+y <- his
+# occasions of first capture
+first <- apply(y, 1, function(x) min(which(x !=0)))
+# constants
+my.constants <- list(N = nrow(y), 
+                     T = ncol(y), 
+                     first = first)
+# data
+my.data <- list(y = y + 1)
+# initial values
+zinits <- y + 1 # non-detection -> alive
+zinits[zinits == 2] <- 1 # dead -> alive
+initial.values <- function() list(phi = runif(1,0,1),
+                                  mu = rnorm(1, 0, 1),
+                                  sig = runif(1,0,5),
+                                  z = zinits)
+# parameters to monitor
+parameters.to.save <- c("phi", "mu", "sig", "p")
+# MCMC details
+n.iter <- 10000
+n.burnin <- 5000
+n.chains <- 2
+# run NIMBLE
+mcmc.phipt <- nimbleMCMC(code = hmm.phipt, 
+                        constants = my.constants,
+                        data = my.data,              
+                        inits = initial.values,
+                        monitors = parameters.to.save,
+                        niter = n.iter,
+                        nburnin = n.burnin, 
+                        nchains = n.chains)
+# numerical summaries
+MCMCvis::MCMCsummary(mcmc.phipt, round = 2)
+```
+
+### TMB
+
+```{r}
+# get simulated data
+data <- his
+
+# define various quantities
+nh <- dim(data)[1]
+k <- dim(data)[2]
+km1 <- k-1
+
+# counts
+eff <- rep(1,nh)
+
+# compute the date of first capture fc, and state at initial capture init.state
+fc <- NULL
+init.state <- NULL
+for (i in 1:nh){
+  temp <- 1:k
+  fc <- c(fc,min(which(data[i,]!=0)))
+  init.state <- c(init.state,data[i,fc[i]])
+}
+
+# transpose data
+data <- t(data)
+
+# load TMB
+library(TMB)
+
+# delete existing files before compilation
+cpp_version <- "phipREt"
+if (file.exists(paste0(cpp_version,".o"))) file.remove(paste0(cpp_version,".so"),
+                                                       paste0(cpp_version,".o"))
+
+# compile and load library
+compile("phipREt.cpp")
+dyn.load(dynlib("phipREt"))
+
+# inits
+parameters <- list(phib = 0.8,
+                   mu = 0,
+                   logsig = 0,
+                   u = rep(0, 19))
+# data
+mydata <- list(ch = data, fc = fc, fs = init.state)
+
+# optimisation
+obj <- MakeADFun(data = mydata, 
+                 parameters = parameters,
+                 random = "u",
+                 DLL = "phipREt")
+obj$hessian <- TRUE
+opt <- optim(par = obj$par, fn = obj$fn, gr = obj$gr, method = "BFGS", 
+             control = list(maxit = 1000), hessian = T)
+
+rep <- sdreport(obj)
+rep
+
+summary(rep, "report")
+```
+
